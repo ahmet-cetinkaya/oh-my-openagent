@@ -210,4 +210,37 @@ describe("session timeout fallback through the real internal-prompt gate", () =>
     expect(deps.sessionAwaitingFallbackResult.has(SESSION_ID)).toBe(true)
   })
 
+  test("#given the real gate queued a timeout dispatch while the session was active #when the session state is replaced before the queue drains #then the stale completion is rejected without a duplicate prompt", async () => {
+    // given
+    SessionCategoryRegistry.register(SESSION_ID, "test")
+    const harness = createGateHarness()
+    harness.sessionStatus = "busy"
+    const deps = createDeps(harness)
+    deps.options = { session_timeout_ms: SESSION_TIMEOUT_MS }
+    const staleState = createFallbackState("openai/gpt-5.4")
+    deps.sessionStates.set(SESSION_ID, staleState)
+    deps.sessionAwaitingFallbackResult.add(SESSION_ID)
+    const helpers = createAutoRetryHelpers(deps)
+    const clock = installRuntimeFallbackTestClock()
+
+    // when
+    helpers.scheduleSessionFallbackTimeout(SESSION_ID, undefined)
+    // The queued dispatch is now polling the still-busy session on the gate's
+    // own retry interval. Replace the FallbackState object entirely - the same
+    // generation change a manual model switch or a fresher dispatch produces -
+    // while that queued entry is still pending its shouldDispatch revalidation.
+    const queued = await pumpUntil(clock, () => deps.sessionRetryInFlight.has(SESSION_ID))
+    const replacementState = createFallbackState("google/gemini-2.5-pro")
+    deps.sessionStates.set(SESSION_ID, replacementState)
+    harness.sessionStatus = "idle"
+    await pumpUntil(clock, () => !deps.sessionRetryInFlight.has(SESSION_ID), 80)
+    helpers.clearSessionFallbackTimeout(SESSION_ID)
+    await flushPromptGateMicrotasks()
+
+    // then
+    expect(queued).toBe(true)
+    expect(harness.promptModels).toEqual([])
+    expect(replacementState.currentModel).toBe("google/gemini-2.5-pro")
+    expect(replacementState.fallbackIndex).toBe(-1)
+  })
 })
