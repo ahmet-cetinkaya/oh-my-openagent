@@ -233,7 +233,10 @@ describe("session timeout fallback through the real internal-prompt gate", () =>
     const replacementState = createFallbackState("google/gemini-2.5-pro")
     deps.sessionStates.set(SESSION_ID, replacementState)
     harness.sessionStatus = "idle"
-    await pumpUntil(clock, () => !deps.sessionRetryInFlight.has(SESSION_ID), 80)
+    // The stale entry is dropped by shouldDispatch, not by a prompt being
+    // sent, so there is no promptModels/sessionRetryInFlight transition to
+    // wait on here. Pump a fixed number of steps to let the gate settle.
+    await pumpUntil(clock, () => false, 40)
     helpers.clearSessionFallbackTimeout(SESSION_ID)
     await flushPromptGateMicrotasks()
 
