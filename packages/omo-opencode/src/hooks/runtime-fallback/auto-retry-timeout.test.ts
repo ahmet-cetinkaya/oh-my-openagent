@@ -12,7 +12,7 @@ type ToastCall = {
   readonly variant: string
 }
 
-function createContext(toasts: ToastCall[] = []): RuntimeFallbackPluginInput {
+function createContext(toasts: ToastCall[] = [], showToast?: RuntimeFallbackPluginInput["client"]["tui"]["showToast"]): RuntimeFallbackPluginInput {
   return {
     client: {
       session: {
@@ -21,23 +21,23 @@ function createContext(toasts: ToastCall[] = []): RuntimeFallbackPluginInput {
         promptAsync: async () => ({}),
       },
       tui: {
-        showToast: async (input) => {
+        showToast: showToast ?? (async (input) => {
           toasts.push({
             title: input.body.title,
             message: input.body.message,
             variant: input.body.variant,
           })
           return {}
-        },
+        }),
       },
     },
     directory: "/test/dir",
   }
 }
 
-function createDeps(toasts: ToastCall[] = []): HookDeps {
+function createDeps(toasts: ToastCall[] = [], showToast?: RuntimeFallbackPluginInput["client"]["tui"]["showToast"]): HookDeps {
   return {
-    ctx: createContext(toasts),
+    ctx: createContext(toasts, showToast),
     config: {
       enabled: true,
       retry_on_errors: [429, 503, 529],
@@ -340,5 +340,54 @@ describe("createFallbackTimeoutHelpers", () => {
     expect(state.currentModel).toBe("google/gemini-2.5-pro")
     expect(state.fallbackIndex).toBe(1)
     expect(state.attemptCount).toBe(7)
+  })
+
+  test("#given a newer fallback generation starts while the terminal notify-toast is pending #when the terminal abort would fire #then it does not abort the newer generation", async () => {
+    // given
+    const sessionID = "session-timeout-terminal-abort-superseded"
+    SessionCategoryRegistry.register(sessionID, "test")
+    let resolveToast: (() => void) | undefined
+    let markToastEntered: (() => void) | undefined
+    const toastStarted = new Promise<void>((resolve) => {
+      markToastEntered = resolve
+    })
+    const deps = createDeps([], async () => {
+      // Signal entry so the test can supersede the state exactly here, then
+      // block until the test releases it - this is the window a newer
+      // fallback generation gets the chance to take over in production.
+      markToastEntered?.()
+      await new Promise<void>((resolve) => {
+        resolveToast = resolve
+      })
+      return {}
+    })
+    deps.config.max_fallback_attempts = 1
+    const state = createFallbackState("openai/gpt-5.4")
+    state.attemptCount = 1
+    deps.sessionStates.set(sessionID, state)
+    deps.sessionAwaitingFallbackResult.add(sessionID)
+
+    const abortSources: string[] = []
+    const helpers = createFallbackTimeoutHelpers(
+      deps,
+      async (_sessionID, source) => {
+        abortSources.push(source)
+      },
+      async () => ({ accepted: true, status: "dispatched" }),
+    )
+    const clock = installRuntimeFallbackTestClock()
+
+    // when
+    helpers.scheduleSessionFallbackTimeout(sessionID)
+    const advancePromise = clock.advanceBy(10)
+    await toastStarted
+    const replacementState = createFallbackState("google/gemini-2.5-pro")
+    deps.sessionStates.set(sessionID, replacementState)
+    resolveToast?.()
+    await advancePromise
+
+    // then
+    expect(abortSources).not.toContain("session.timeout.fallback-exhausted")
+    expect(replacementState.currentModel).toBe("google/gemini-2.5-pro")
   })
 })

@@ -1,4 +1,4 @@
-import type { AutoRetryDispatchOutcome, HookDeps, RuntimeFallbackTimeout } from "./types"
+import type { AutoRetryDispatchOutcome, FallbackState, HookDeps, RuntimeFallbackTimeout } from "./types"
 import { HOOK_NAME } from "./constants"
 import { log } from "../../shared/logger"
 import { getFallbackModelsForSession } from "./fallback-models"
@@ -45,6 +45,7 @@ export function createFallbackTimeoutHelpers(
   // this the session keeps waiting on a fallback that will never arrive (#6637).
   const failSessionFallbackTerminally = async (
     sessionID: string,
+    expectedState: FallbackState,
     reason: string,
     details: Record<string, unknown> = {},
   ) => {
@@ -71,6 +72,16 @@ export function createFallbackTimeoutHelpers(
           },
         })
         .catch(() => {})
+    }
+
+    // The toast await can yield long enough for a newer fallback generation to
+    // take over this session. Aborting that generation would cancel a retry
+    // this call never owned, so ownership is revalidated right before dispatch.
+    if (sessionStates.get(sessionID) !== expectedState) {
+      log(`[${HOOK_NAME}] Session fallback terminal abort skipped for superseded generation`, {
+        sessionID,
+      })
+      return
     }
 
     await abortSessionRequest(sessionID, TERMINAL_ABORT_SOURCE)
@@ -125,7 +136,7 @@ export function createFallbackTimeoutHelpers(
 
       const fallbackModels = getFallbackModelsForSession(sessionID, resolvedAgent, pluginConfig)
       if (fallbackModels.length === 0) {
-        await failSessionFallbackTerminally(sessionID, "no fallback models configured")
+        await failSessionFallbackTerminally(sessionID, state, "no fallback models configured")
         return
       }
 
@@ -139,6 +150,7 @@ export function createFallbackTimeoutHelpers(
       if (!result.success || !result.newModel) {
         await failSessionFallbackTerminally(
           sessionID,
+          state,
           result.maxAttemptsReached ? "max fallback attempts reached" : "no available fallback models",
           { attemptCount: state.attemptCount },
         )
@@ -184,7 +196,7 @@ export function createFallbackTimeoutHelpers(
       })
 
       if (attemptsUsed >= config.max_fallback_attempts) {
-        await failSessionFallbackTerminally(sessionID, "max fallback attempts reached", {
+        await failSessionFallbackTerminally(sessionID, state, "max fallback attempts reached", {
           attemptCount: attemptsUsed,
         })
         return
