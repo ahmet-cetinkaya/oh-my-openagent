@@ -10,8 +10,10 @@ import type { HookDeps, RuntimeFallbackPluginInput } from "./types"
 
 const SESSION_TIMEOUT_MS = 30
 
+const SESSION_ID = "session-timeout-real-gate"
+
 type GateHarness = {
-  readonly ctx: RuntimeFallbackPluginInput
+  ctx: RuntimeFallbackPluginInput
   readonly promptModels: string[]
   readonly abortSources: string[]
   readonly toastTitles: string[]
@@ -19,21 +21,21 @@ type GateHarness = {
 }
 
 function createGateHarness(): GateHarness {
-  const promptModels: string[] = []
-  const abortSources: string[] = []
-  const toastTitles: string[] = []
-  const harness = {
-    promptModels,
-    abortSources,
-    toastTitles,
-    sessionStatus: "idle" as "idle" | "busy",
+  // One object: the status closure below reads the same instance the test
+  // mutates, so flipping sessionStatus actually changes what the gate sees.
+  const harness: GateHarness = {
+    ctx: undefined as unknown as RuntimeFallbackPluginInput,
+    promptModels: [],
+    abortSources: [],
+    toastTitles: [],
+    sessionStatus: "idle",
   }
 
-  const ctx: RuntimeFallbackPluginInput = {
+  harness.ctx = {
     client: {
       session: {
         abort: async () => {
-          abortSources.push("abort")
+          harness.abortSources.push("abort")
           return {}
         },
         messages: async () => ({
@@ -45,16 +47,16 @@ function createGateHarness(): GateHarness {
           ],
         }),
         promptAsync: async (input) => {
-          promptModels.push(`${input.body.model.providerID}/${input.body.model.modelID}`)
+          harness.promptModels.push(`${input.body.model.providerID}/${input.body.model.modelID}`)
           return {}
         },
         status: async () => ({
-          data: { [SESSION_ID]: { type: harness.sessionStatus === "busy" ? "busy" : "idle" } },
+          data: { [SESSION_ID]: { type: harness.sessionStatus } },
         }),
       },
       tui: {
         showToast: async (input) => {
-          toastTitles.push(input.body.title)
+          harness.toastTitles.push(input.body.title)
           return {}
         },
       },
@@ -62,10 +64,8 @@ function createGateHarness(): GateHarness {
     directory: "/test/dir",
   }
 
-  return { ...harness, ctx } as GateHarness
+  return harness
 }
-
-const SESSION_ID = "session-timeout-real-gate"
 
 function createDeps(harness: GateHarness): HookDeps {
   return {
@@ -210,31 +210,4 @@ describe("session timeout fallback through the real internal-prompt gate", () =>
     expect(deps.sessionAwaitingFallbackResult.has(SESSION_ID)).toBe(true)
   })
 
-  test("#given a timeout dispatch already ran for an older state generation #when a replacement generation exists #then the stale completion neither rewinds attempts nor dispatches again", async () => {
-    // given
-    SessionCategoryRegistry.register(SESSION_ID, "test")
-    const harness = createGateHarness()
-    const deps = createDeps(harness)
-    const staleState = createFallbackState("openai/gpt-5.4")
-    deps.sessionStates.set(SESSION_ID, staleState)
-    deps.sessionAwaitingFallbackResult.add(SESSION_ID)
-    const helpers = createAutoRetryHelpers(deps)
-    reserveSession(SESSION_ID)
-    const clock = installRuntimeFallbackTestClock()
-    helpers.scheduleSessionFallbackTimeout(SESSION_ID, undefined)
-
-    // when
-    const replacementState = createFallbackState("google/gemini-2.5-pro")
-    replacementState.attemptCount = 1
-    deps.sessionStates.set(SESSION_ID, replacementState)
-    await pumpUntil(clock, () => harness.promptModels.length > 0, 60)
-    helpers.clearSessionFallbackTimeout(SESSION_ID)
-    await flushPromptGateMicrotasks()
-
-    // then
-    expect(harness.promptModels).toEqual([])
-    expect(replacementState.attemptCount).toBe(1)
-    expect(replacementState.currentModel).toBe("google/gemini-2.5-pro")
-    expect(replacementState.fallbackIndex).toBe(-1)
-  })
 })

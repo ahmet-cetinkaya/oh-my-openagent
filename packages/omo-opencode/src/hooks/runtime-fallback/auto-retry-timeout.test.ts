@@ -241,8 +241,11 @@ describe("createFallbackTimeoutHelpers", () => {
     const abortSources: string[] = []
     const helpers = createFallbackTimeoutHelpers(
       deps,
-      async (_sessionID, source) => {
+      async (abortedSessionID, source) => {
         abortSources.push(source)
+        if (source === "session.timeout") {
+          deps.internallyAbortedSessions.add(abortedSessionID)
+        }
       },
       async () => ({ accepted: true, status: "dispatched" }),
     )
@@ -256,6 +259,7 @@ describe("createFallbackTimeoutHelpers", () => {
     expect(abortSources).toEqual(["session.timeout"])
     expect(toasts).toEqual([])
     expect(deps.sessionFallbackTimeouts.has(sessionID)).toBe(false)
+    expect(deps.internallyAbortedSessions.has(sessionID)).toBe(false)
   })
 
   test("#given timeout callback awaits abort #when manual model change replaces state #then the stale generation never dispatches", async () => {
@@ -299,5 +303,42 @@ describe("createFallbackTimeoutHelpers", () => {
     // then
     expect(retryCalls).toBe(0)
     expect(replacementState.currentModel).toBe("google/gemini-2.5-pro")
+  })
+
+  test("#given a superseding retry advances the same state object while a timeout dispatch is in flight #when that dispatch is rejected #then the newer retry is not rolled back", async () => {
+    // given
+    const sessionID = "session-timeout-superseded-in-flight"
+    SessionCategoryRegistry.register(sessionID, "test")
+    const deps = createDeps()
+    const state = createFallbackState("openai/gpt-5.4")
+    deps.sessionStates.set(sessionID, state)
+    deps.sessionAwaitingFallbackResult.add(sessionID)
+
+    let dispatchCount = 0
+    const helpers = createFallbackTimeoutHelpers(
+      deps,
+      async () => {},
+      async () => {
+        dispatchCount += 1
+        // A concurrent retry advances the very same FallbackState object without
+        // replacing it, so an identity-only guard would still consider this
+        // rejected dispatch the owner and rewind the newer retry.
+        state.currentModel = "google/gemini-2.5-pro"
+        state.fallbackIndex = 1
+        state.attemptCount = 7
+        return { accepted: false, status: "blocked", reason: "test gate blocked dispatch" }
+      },
+    )
+    const clock = installRuntimeFallbackTestClock()
+
+    // when
+    helpers.scheduleSessionFallbackTimeout(sessionID)
+    await clock.advanceBy(10)
+
+    // then
+    expect(dispatchCount).toBe(1)
+    expect(state.currentModel).toBe("google/gemini-2.5-pro")
+    expect(state.fallbackIndex).toBe(1)
+    expect(state.attemptCount).toBe(7)
   })
 })

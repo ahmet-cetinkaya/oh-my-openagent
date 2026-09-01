@@ -53,6 +53,11 @@ export function createFallbackTimeoutHelpers(
     const wasAwaitingFallbackResult = deps.sessionAwaitingFallbackResult.delete(sessionID)
 
     log(`[${HOOK_NAME}] Session fallback exhausted`, { sessionID, reason, ...details })
+
+    // The timeout path already marked this session as internally aborted. Leaving
+    // that marker behind would make a later real abort look like our own fallback
+    // handoff and preserve fallback state that no longer has an owner.
+    deps.internallyAbortedSessions.delete(sessionID)
     if (!wasAwaitingFallbackResult) return
 
     if (config.notify_on_fallback) {
@@ -68,7 +73,6 @@ export function createFallbackTimeoutHelpers(
         .catch(() => {})
     }
 
-    deps.internallyAbortedSessions.delete(sessionID)
     await abortSessionRequest(sessionID, TERMINAL_ABORT_SOURCE)
   }
 
@@ -141,11 +145,25 @@ export function createFallbackTimeoutHelpers(
         return
       }
 
+      const preparedOwnership = {
+        currentModel: state.currentModel,
+        fallbackIndex: state.fallbackIndex,
+        attemptCount: state.attemptCount,
+      }
+
       const dispatchOutcome = await autoRetryWithFallback(sessionID, result.newModel, resolvedAgent, "session.timeout")
       if (dispatchOutcome.accepted) return
 
-      if (sessionStates.get(sessionID) !== state) {
-        log(`[${HOOK_NAME}] Session timeout fallback rejection skipped for stale state generation`, {
+      // Identity alone is not ownership: a superseding retry can advance the same
+      // FallbackState object without replacing it. Only the dispatch that still
+      // owns exactly what prepareFallback produced may roll that preparation back.
+      const stillOwnsPreparedState =
+        sessionStates.get(sessionID) === state &&
+        state.currentModel === preparedOwnership.currentModel &&
+        state.fallbackIndex === preparedOwnership.fallbackIndex &&
+        state.attemptCount === preparedOwnership.attemptCount
+      if (!stillOwnsPreparedState) {
+        log(`[${HOOK_NAME}] Session timeout fallback rejection skipped for superseded dispatch`, {
           sessionID,
         })
         return
