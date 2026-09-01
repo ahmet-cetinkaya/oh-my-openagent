@@ -342,24 +342,47 @@ describe("createFallbackTimeoutHelpers", () => {
     expect(state.attemptCount).toBe(7)
   })
 
-  test("#given a newer fallback generation starts while the terminal notify-toast is pending #when the terminal abort would fire #then it does not abort the newer generation", async () => {
+  test("#given the notify toast never settles #when the fallback budget is exhausted #then the terminal abort still fires", async () => {
     // given
+    const sessionID = "session-timeout-toast-never-settles"
+    SessionCategoryRegistry.register(sessionID, "test")
+    const deps = createDeps([], () => new Promise(() => {}))
+    deps.config.max_fallback_attempts = 1
+    const state = createFallbackState("openai/gpt-5.4")
+    state.attemptCount = 1
+    deps.sessionStates.set(sessionID, state)
+    deps.sessionAwaitingFallbackResult.add(sessionID)
+
+    const abortSources: string[] = []
+    const helpers = createFallbackTimeoutHelpers(
+      deps,
+      async (_sessionID, source) => {
+        abortSources.push(source)
+      },
+      async () => ({ accepted: true, status: "dispatched" }),
+    )
+    const clock = installRuntimeFallbackTestClock()
+
+    // when
+    helpers.scheduleSessionFallbackTimeout(sessionID)
+    await clock.advanceBy(10)
+
+    // then
+    expect(abortSources).toContain("session.timeout.fallback-exhausted")
+  })
+
+  test("#given a newer fallback generation replaces the session state during the fire-and-forget toast dispatch #when the terminal abort would fire #then it does not abort the newer generation", async () => {
+    // given
+    // showToast is invoked but not awaited, so its body still runs
+    // synchronously up to its own first await - the same window a
+    // synchronous side effect from a concurrent caller could land in.
     const sessionID = "session-timeout-terminal-abort-superseded"
     SessionCategoryRegistry.register(sessionID, "test")
-    let resolveToast: (() => void) | undefined
-    let markToastEntered: (() => void) | undefined
-    const toastStarted = new Promise<void>((resolve) => {
-      markToastEntered = resolve
-    })
-    const deps = createDeps([], async () => {
-      // Signal entry so the test can supersede the state exactly here, then
-      // block until the test releases it - this is the window a newer
-      // fallback generation gets the chance to take over in production.
-      markToastEntered?.()
-      await new Promise<void>((resolve) => {
-        resolveToast = resolve
-      })
-      return {}
+    let replacementState: ReturnType<typeof createFallbackState> | undefined
+    const deps = createDeps([], () => {
+      replacementState = createFallbackState("google/gemini-2.5-pro")
+      deps.sessionStates.set(sessionID, replacementState)
+      return new Promise(() => {})
     })
     deps.config.max_fallback_attempts = 1
     const state = createFallbackState("openai/gpt-5.4")
@@ -379,15 +402,11 @@ describe("createFallbackTimeoutHelpers", () => {
 
     // when
     helpers.scheduleSessionFallbackTimeout(sessionID)
-    const advancePromise = clock.advanceBy(10)
-    await toastStarted
-    const replacementState = createFallbackState("google/gemini-2.5-pro")
-    deps.sessionStates.set(sessionID, replacementState)
-    resolveToast?.()
-    await advancePromise
+    await clock.advanceBy(10)
 
     // then
+    expect(replacementState).toBeDefined()
     expect(abortSources).not.toContain("session.timeout.fallback-exhausted")
-    expect(replacementState.currentModel).toBe("google/gemini-2.5-pro")
+    expect(deps.sessionStates.get(sessionID)).toBe(replacementState)
   })
 })

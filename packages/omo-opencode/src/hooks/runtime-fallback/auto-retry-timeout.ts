@@ -62,7 +62,10 @@ export function createFallbackTimeoutHelpers(
     if (!wasAwaitingFallbackResult) return
 
     if (config.notify_on_fallback) {
-      await deps.ctx.client.tui
+      // Best effort, not awaited: a showToast() call that never settles must
+      // not block the terminal abort below, or the caller is left hanging on
+      // the very rejected-fallback path this function exists to bound.
+      void deps.ctx.client.tui
         .showToast({
           body: {
             title: "Model Fallback Failed",
@@ -74,9 +77,10 @@ export function createFallbackTimeoutHelpers(
         .catch(() => {})
     }
 
-    // The toast await can yield long enough for a newer fallback generation to
-    // take over this session. Aborting that generation would cancel a retry
-    // this call never owned, so ownership is revalidated right before dispatch.
+    // The caller already awaited a dispatch or a prepare step before reaching
+    // this function, which is enough time for a newer fallback generation to
+    // take over the session. Aborting that generation would cancel a retry
+    // this call never owned, so ownership is revalidated before the abort.
     if (sessionStates.get(sessionID) !== expectedState) {
       log(`[${HOOK_NAME}] Session fallback terminal abort skipped for superseded generation`, {
         sessionID,
