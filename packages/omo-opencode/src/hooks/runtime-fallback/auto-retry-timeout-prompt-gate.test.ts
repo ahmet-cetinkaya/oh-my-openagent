@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 
 import { releaseAllPromptAsyncReservationsForTesting } from "../../shared/prompt-async-gate"
 import { setPromptReservation } from "@oh-my-opencode/utils/prompt-async-gate/reservations"
+import { getQueuedPromptBlocker, isPromptQueueDraining } from "@oh-my-opencode/utils/prompt-async-gate/queue"
 import { createAutoRetryHelpers } from "./auto-retry"
 import { createFallbackState } from "./fallback-state"
 import { SessionCategoryRegistry } from "../../shared/session-category-registry"
@@ -234,14 +235,19 @@ describe("session timeout fallback through the real internal-prompt gate", () =>
     deps.sessionStates.set(SESSION_ID, replacementState)
     harness.sessionStatus = "idle"
     // The stale entry is dropped by shouldDispatch, not by a prompt being
-    // sent, so there is no promptModels/sessionRetryInFlight transition to
-    // wait on here. Pump a fixed number of steps to let the gate settle.
-    await pumpUntil(clock, () => false, 40)
+    // sent, so promptModels/sessionRetryInFlight never transition here. The
+    // gate's own queue state (no blocker, not draining) is the actual signal
+    // that the pending dispatch drained and was rejected.
+    const drained = await pumpUntil(
+      clock,
+      () => getQueuedPromptBlocker(SESSION_ID) === undefined && !isPromptQueueDraining(SESSION_ID),
+    )
     helpers.clearSessionFallbackTimeout(SESSION_ID)
     await flushPromptGateMicrotasks()
 
     // then
     expect(queued).toBe(true)
+    expect(drained).toBe(true)
     expect(harness.promptModels).toEqual([])
     expect(replacementState.currentModel).toBe("google/gemini-2.5-pro")
     expect(replacementState.fallbackIndex).toBe(-1)
